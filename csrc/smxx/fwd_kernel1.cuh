@@ -18,6 +18,7 @@ struct K1Layouts {
         make_shape(Int<CHUNK>{}, Int<CHUNK>{}),
         LayoutLeft{}
     ));
+    using LF32Layout = decltype(make_layout(make_shape(Int<CHUNK>{}, Int<CHUNK>{}), LayoutRight{}));
     using TransposedLMLayout = decltype(tile_to_shape(
         GMMA::Layout_MN_INTER_Atom<cute::bfloat16_t>{},
         make_shape(Int<CHUNK>{}, Int<CHUNK>{}),
@@ -63,7 +64,7 @@ struct SharedStorageK1 {
             alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<MMALayout>> k_decayed;
             alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<MMALayout>> q_decayed;
             alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<MMALayout>> k_inv;
-            alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<LMLayout>> L;
+            alignas(128) cute::ArrayEngine<float, cute::cosize_v<LMLayout>> L;
             alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<LMLayout>> INV;
             alignas(128) cute::ArrayEngine<BF16, cute::cosize_v<LMLayout>> Mqk;
         };
@@ -140,7 +141,6 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
 ) {
     // --- constants
     using BF16 = cutlass::bfloat16_t;
-    using FP16 = cutlass::half_t;
     using Layouts = K1Layouts<D, CHUNK>;
     using MMALayout = typename Layouts::MMALayout;
     using QKLayout = typename Layouts::QKLayout;
@@ -148,6 +148,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     using BetaSmemLayout = typename Layouts::BetaSmemLayout;
     using GTotalLayout = typename Layouts::GTotalLayout;
     using LMLayout = typename Layouts::LMLayout;
+    using LF32Layout = typename Layouts::LF32Layout;
     using TransposedLMLayout = typename Layouts::TransposedLMLayout;
     using TMAQKLayout = typename Layouts::TMAQKLayout;
     using TMABetaSmemLayout = typename Layouts::TMABetaSmemLayout;
@@ -474,43 +475,40 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     }
     __syncthreads();
 
-    Tensor L = make_tensor(make_smem_ptr(shared_storage.L.begin()), LMLayout{});
+    Tensor L_fp32 = make_tensor(make_smem_ptr(shared_storage.L.begin()), LF32Layout{});
     Tensor Mqk = make_tensor(make_smem_ptr(shared_storage.Mqk.begin()), LMLayout{});
-    Tensor L_fp16 = make_tensor(make_smem_ptr(reinterpret_cast<FP16*>(shared_storage.L.begin())), LMLayout{});
 
 // L_Mqk
     if (compute_tid < 32) {
-        mma_m16n16_bf16bf16fp16_1warp(k_decayed, k_inv, L_fp16, compute_tid);
+        mma_m16n16_bf16bf16fp32_1warp(k_decayed, k_inv, L_fp32, compute_tid);
     } else if (compute_tid >= 32 && compute_tid < 64) {
         mma_m16n16_bf16bf16bf16_1warp(q_decayed, k_inv, Mqk, compute_tid - 32);
     }
     __syncthreads();
 
     Tensor INV = make_tensor(make_smem_ptr(shared_storage.INV.begin()), LMLayout{});
-    Tensor INV_fp16 = make_tensor(make_smem_ptr(reinterpret_cast<FP16*>(shared_storage.INV.begin())), LMLayout{});
+    // Merge matrix M is staged into the (dead) k_inv smem buffer.
+    Tensor M_bf16 = make_tensor(make_smem_ptr(shared_storage.k_inv.begin()), LMLayout{});
 
-// tril_IL + INV = I - L (merged, same thread same element)
+// tril L (beta applied) + tril Mqk (merged, same thread same element)
     if (compute_tid < 256) {
         const int col_block_size = 8;
         int block_idx = compute_tid / (CHUNK * col_block_size);
         int i = (compute_tid / col_block_size) % CHUNK;
         int j = compute_tid % col_block_size + block_idx * col_block_size;
         if (i <= j) {
-            L_fp16(i, j) = FP16::bitcast(0);
+            L_fp32(i, j) = 0.0f;
         } else {
-            L_fp16(i, j) = L_fp16(i, j) * FP16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + i))));
+            L_fp32(i, j) = L_fp32(i, j) * sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + i)));
         }
         if (i < j) {
             Mqk(i, j) = BF16::bitcast(0);
         }
-        // INV = I - L (same thread reads L(i,j) it just wrote)
-        FP16 x = L_fp16(i, j);
-        INV_fp16(i, j) = (i == j ? FP16(1.0f) - x : -x);
     }
     __syncthreads();
 
-// inv (Neumann series, fused in registers)
-    neumann_inv_fused_1warp(L_fp16, INV_fp16, INV, compute_tid);
+// inv (8x8 fp32 forward substitution + 16x16 bf16-HMMA merge, fused in registers)
+    inv_fwd_subst_fused_1warp(L_fp32, M_bf16, INV, compute_tid);
     // Fence + sync combined: completion + TMA visibility
     cutlass::arch::fence_view_async_shared();
     __syncthreads();
